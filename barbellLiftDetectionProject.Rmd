@@ -1,0 +1,216 @@
+---
+title: "Barbell Lift Detection"
+author: "Michael Kamfonas"
+date: "November 17, 2015"
+output: html_document
+---
+
+## Introduction
+
+This is an assigned project for the Coursera Machine Learning course. 
+Data have been downloaded to local directory from: 
+
+*   https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+*   https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv
+
+Documentation is here: http://groupware.les.inf.puc-rio.br/har
+
+### Acknowledgement
+
+Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013. 
+
+Read more: http://groupware.les.inf.puc-rio.br/har#ixzz3rmC336RS
+
+### Data Load and Preparation
+
+```{r , cache=TRUE}
+require(caret);
+testRaw<-read.csv("pml-testing.csv")
+trainRaw<-read.csv("pml-training.csv")
+#str(trainRaw,list.len = 160)
+dim(trainRaw);dim(testRaw)
+```
+
+Collect metadata on each column of both training and test data frames. The table generated indicates which columns have NA, zero and near-zero values. It also identifies where there is a mismatch between classes of training and test data. 
+
+```{r}
+M<-nearZeroVar(trainRaw,saveMetrics = TRUE) # find near-zero and zero values
+M<-cbind(M,trainClass=sapply(trainRaw,class),testClass=sapply(testRaw,class))
+M<-cbind(M,naTrainCount=apply(trainRaw,2,FUN=function(C){sum(is.na(C))}))
+M<-cbind(M,naTestCount=apply(testRaw,2,FUN=function(C){sum(is.na(C))}))
+M<-cbind(M,emptyCount=apply(trainRaw,2,FUN=function(C){sum(C==""||C==" ")}))
+M<-cbind(M,invalidCount=apply(trainRaw,2,FUN=function(C){sum(C=="#DIV/0!")}))
+M$class.mismatch <- as.character(M$trainClass)!=as.character(M$testClass)
+View(M)
+```
+
+## Covariate Selection
+
+### Remove identifiers, NAs and NZVs
+
+Exclude columns that are not used in the training set and also exclude the first six identifying columns. We don't want the algorithm to base decision on who the participant was, or the itme of the observation or the window ID. 
+
+
+```{r}
+require(dplyr);require(tidyr)
+M$filterNames<- M$naTestCount==0  
+M$filterNames[1:7] <- FALSE
+colList <- row.names(M[M$filterNames,])
+colList <- c(colList,"problem_id")                  # last var is different in training and testing
+training <-trainRaw[,names(trainRaw) %in% colList]  # variables to use from training set
+testing  <-testRaw[,names(testRaw) %in% colList]    # variables to use from test set
+nearZeroVar(training)                               # verify no near-zero covariates
+```
+
+### Check for correlated predictors. 
+
+```{r}
+C <- abs(cor(training[,! names(training) %in% c("classe")]))
+dim(C)
+diag(C) <- 0
+which(C > 0.9,arr.ind=T)
+```
+
+Apparently there are a number of highly correlated variables. Principal component analysis is a better way to address this.
+
+### Preliminary PCA
+
+Check PCA for all variables and plot first two with color that correpsonds to classe:
+
+```{r}
+trainCoVars<-training[,! names(training) %in% c("classe")]
+prComp <- prcomp(trainCoVars)
+plot(prComp$x[,1],prComp$x[,2],col=training$classe)
+legend("topleft",legend=levels(training$classe),fill =unique(as.integer(training$classe)))
+```
+
+We further develop four models, two of which are using PCA to limit predictors.
+
+## Analysis
+
+### Simple Clustering
+
+```{r}
+modFit <- train(classe ~ . , method="rpart",data=training)
+modFit
+```
+
+This is an unsatisfactory solution with low accuracy. 
+
+```{r}
+library(rattle)
+
+fancyRpartPlot(modFit$finalModel)
+
+```
+
+### Clustering with PCA
+
+```{r}
+modFit <- train(classe ~ .,method="rpart",preProcess="pca", data=training)
+modFit
+```
+
+This provides marginal improvement. Accuracy is still low. 
+
+```{r}
+library(rattle)
+fancyRpartPlot(modFit$finalModel)
+
+```
+
+### Analysis with Random Forest 
+
+We will first limit PCA to use the top 10 variables. Attempts to run with all variables takes way too long. We generate the top 10 variables into a prepared.training and prepared.testing data frames using the caret preProcess function. We also choose to use proximity = FALSE when training to improve performance. 
+
+
+```{r}
+require(caret);
+training.covars <- training[,! names(training) %in% c("classe")]
+testing.covars <- testing[,! names(testing) %in% c("problem_id")]
+training.outcome <- training$classe
+preProc <- preProcess(training.covars,method="pca",pcaComp=10)
+prepared.training <- predict(preProc,training.covars)
+prepared.testing <- predict(preProc,testing.covars)
+```
+
+A plot that follows shows the top two of the PCA-derived covariates with points colored according to the five classes. Two variables are not enough to see a pattern, but the segregation of types starts to become evident. 
+
+We proceed with training a random forest model with the 10 best predictors derived through PCA.
+
+
+```{r}
+plot(prepared.training[,1],prepared.training[,2],col=training$classe)
+legend("topleft",legend=levels(training$classe),fill =unique(as.integer(training$classe)))
+
+modFit <- train(training.outcome ~ . , 
+                method="rf",
+                proximity = FALSE ,
+                data=prepared.training)
+modFit
+```
+
+The model has good accuracy and its confusion matrix looks satisfactory, This is our best model so far. Given the 95% accuracy, we still expect to miss one or two of the test predictions.  
+
+```{r}
+modFit$finalModel
+```
+
+
+We use the prepared.testing data set for prediction followed by processing the data for submitting answers. 
+
+```{r}
+  pred <- predict(modFit,newdata = prepared.testing)
+  answ <- as.character(pred)
+  answ
+  
+  pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+projDir<- getwd()
+setwd("answers")
+pml_write_files(answ)
+setwd(projDir)
+getwd()
+```
+
+As suspected, two of our submissions were incorrect. Next we will try all non-NA variables so we don't need PCA. 
+
+## Random Forest - 50 variables - NO PCA
+
+
+```{r}
+modFit2 <- train(training.outcome ~ . , 
+                method="rf",
+                proximity = FALSE ,
+                data=training.covars)
+modFit2
+```
+
+The model has good accuracy, OOB error of 0.4% and it should provide the best prediction of all models tried. Its confusion matrix confirms this.  
+
+```{r}
+modFit2$finalModel
+```
+
+
+Compare results between answ2 (last attempt) and previous attempt ans2: 
+
+```{r}
+  pred2 <- predict(modFit2,newdata = testing.covars)
+  answ2 <- as.character(pred2)
+  answ2
+  answ
+
+projDir<- getwd()
+setwd("answer2")
+pml_write_files(answ2)
+setwd(projDir)
+getwd()
+
+```
+
